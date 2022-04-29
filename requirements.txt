@@ -1,0 +1,9 @@
+scikit-learn
+tensorflow
+gym
+torch
+pyvirtualdisplay
+piglet
+JSAnimation
+pygame
+matplotlib
