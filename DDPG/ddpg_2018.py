@@ -1,0 +1,208 @@
+# -*- coding: utf-8 -*-
+import math
+import random
+import copy
+import os
+
+import gym
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions import Normal
+
+"""##Utils Functions"""
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[int(self.position)] = (state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = map(np.stack, zip(*batch))
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+def hard_update(target, source):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(param.data)
+
+def soft_update(target, source, tau):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+
+class OUNoise:
+    def __init__(self, size, mu = 0.0,
+                 theta = 0.15, sigma = 0.2):
+        """Initialize parameters and noise process."""
+        self.state = np.float64(0.0)
+        self.mu = mu * np.ones(size)
+        self.theta = theta
+        self.sigma = sigma
+        self.reset()
+
+    def reset(self):
+        """Reset the internal state (= noise) to mean (mu)."""
+        self.state = copy.copy(self.mu)
+
+    def sample(self):
+        """Update internal state and return it as a noise sample."""
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.array(
+            [random.random() for _ in range(len(x))]
+        )
+        self.state = x + dx
+        return self.state
+
+"""##Network Definitions
+
+###Critic Network
+"""
+class Critic(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(Critic, self).__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, state, action):
+        """
+        Params state and actions are torch tensors
+        """
+        x = torch.cat([state, action], 1)
+        x = F.relu(self.linear1(x))
+        x = F.relu(self.linear2(x))
+        x = self.linear3(x)
+
+        return x
+
+    def to(self, device):
+        return super(Critic, self).to(device)
+
+"""###Actor Network"""
+
+class Actor(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, learning_rate = 1e-4):
+        super(Actor, self).__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, state):
+        """
+        Param state is a torch tensor
+        """
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+        x = torch.tanh(self.linear3(x))
+
+        return x
+
+    def to(self, device):
+        return super(Actor, self).to(device)
+
+"""##DDPG Agent - [Pytorch DDPG](https://colab.research.google.com/github/MrSyee/pg-is-all-you-need/blob/master/03.DDPG.ipynb) - Building an algo for finding the best π(at|st)."""
+
+class DDPGAgent:
+    def __init__(self, obs_dim, action_dim, replay_buffer, ou_noise_theta = 1.0,
+                 ou_noise_sigma = 0.1, hidden_dim = 256,initial_random_steps=1e4,
+                 device=torch.device( "cuda:0" if torch.cuda.is_available() else "cpu")):
+        """Initialize."""
+        self.replay_buffer = replay_buffer
+        self.initial_random_steps = initial_random_steps
+        self.checkpoint_dir = "./saved_models/"
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # noise
+        self.noise = OUNoise(action_dim, theta=ou_noise_theta, sigma=ou_noise_sigma)
+
+        # device: cpu / gpu
+        self.device = device
+
+        # set the losses
+        self.critic_loss = nn.MSELoss()
+
+        # networks
+        self.actor = Actor(obs_dim, hidden_dim, action_dim).to(device)
+        self.actor_target = Actor(obs_dim, hidden_dim, action_dim).to(device)
+        
+        self.critic = Critic(obs_dim + action_dim, hidden_dim, 1).to(device)
+        self.critic_target = Critic(obs_dim + action_dim, hidden_dim, 1).to(device)
+
+        # optimizer
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-4)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3)
+        
+        hard_update(self.actor_target, self.actor) # Make sure target is with the same weight
+        hard_update(self.critic_target, self.critic)
+        
+        # total steps count
+        self.total_step = 0
+
+        # mode: train / test
+        self.is_test = False
+        
+        self.log = {'critic_loss': [], 'actor_loss': []}
+    def get_action(self, state): # state: np.ndarray
+        """Select an action from the input state."""
+        # if initial random action should be conducted
+        if self.total_step < self.initial_random_steps and not self.is_test:
+            selected_action = random.choice([0,1,2])
+        else:
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            selected_action = self.actor.forward(state).detach().cpu().numpy()
+            select_action = select_action[0].tolist()
+            select_action = select_action.index(max(select_action))
+        return selected_action
+    
+    def update_model(self, batch_size, gamma=0.99, soft_tau=5e-3):
+        state, action, reward, next_state, done = self.replay_buffer.sample(batch_size)
+
+        state = torch.FloatTensor(state).to(self.device)
+        next_state = torch.FloatTensor(next_state).to(self.device)
+        action = torch.FloatTensor(action).to(self.device)
+        reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
+        done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(self.device)
+        
+        masks = 1 - done
+        next_action = self.actor_target.forward(next_state)
+        next_value = self.critic_target.forward(next_state, next_action)
+        curr_return = reward + gamma * next_value * masks
+        
+        # train critic
+        values = self.critic.forward(state, action)
+        critic_loss = self.critic_loss(values, curr_return)
+        
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+                
+        # train actor
+        action = self.actor.forward(state)
+        actor_loss = -self.critic.forward(state, action).mean()
+        
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        # target update
+        soft_update(self.actor_target, self.actor, soft_tau)
+        soft_update(self.critic_target, self.critic, soft_tau)
+        
+        print("actor_loss: ", actor_loss.item())
+        print("critic_loss: ", critic_loss.item())
+        
+        self.log['actor_loss'].append(actor_loss.item())
+        self.log['actor_loss'].append(critic_loss.item())
